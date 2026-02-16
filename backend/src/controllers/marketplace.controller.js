@@ -1,59 +1,171 @@
 const db = require('../config/db');
 
-// Listar itens à venda
+/*
+==================================================
+LISTAR ITENS À VENDA
+==================================================
+*/
 exports.getListings = async (req, res) => {
   try {
-    const items = await db.query(
-      'SELECT * FROM items WHERE is_listed = true AND active = true ORDER BY created_at DESC'
-    );
-    res.json(items.rows);
-  } catch (err) {
+    const result = await db.query(`
+      SELECT *
+      FROM items
+      WHERE is_listed = true
+      AND active = true
+      ORDER BY created_at DESC
+    `);
+
+    res.status(200).json(result.rows);
+  } catch (error) {
+    console.error("Erro ao listar marketplace:", error);
     res.status(500).json({ message: 'Erro ao listar mercado' });
   }
 };
 
-// Comprar Item
+
+/*
+==================================================
+COMPRAR ITEM (TRANSAÇÃO ATÔMICA E SEGURA)
+==================================================
+*/
 exports.buyItem = async (req, res) => {
   const { itemId } = req.body;
   const buyerId = req.user.id;
 
+  if (!itemId) {
+    return res.status(400).json({ message: "ID do item é obrigatório" });
+  }
+
+  const client = await db.pool.connect();
+
   try {
-    const itemRes = await db.query('SELECT * FROM items WHERE id = $1 AND is_listed = true', [itemId]);
-    if (itemRes.rows.length === 0) return res.status(404).json({ message: 'Item indisponível' });
+    await client.query('BEGIN');
+
+    /*
+    1️⃣ Buscar item com LOCK
+    */
+    const itemRes = await client.query(
+      `SELECT * FROM items
+       WHERE id = $1
+       AND is_listed = true
+       AND active = true
+       FOR UPDATE`,
+      [itemId]
+    );
+
+    if (itemRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Item indisponível' });
+    }
 
     const item = itemRes.rows[0];
     const sellerId = item.owner_id;
     const price = item.price;
 
-    if (buyerId === sellerId) return res.status(400).json({ message: 'Você não pode comprar seu próprio item' });
-
-    // Verificar Saldo
-    const buyerRes = await db.query('SELECT coins FROM users WHERE id = $1', [buyerId]);
-    if (buyerRes.rows[0].coins < price) {
-        return res.status(400).json({ message: 'Saldo insuficiente' });
+    if (buyerId === sellerId) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Você não pode comprar seu próprio item' });
     }
 
-    // Transação
-    await db.query('BEGIN');
+    /*
+    2️⃣ Lock comprador
+    */
+    const buyerRes = await client.query(
+      'SELECT coins FROM users WHERE id = $1 FOR UPDATE',
+      [buyerId]
+    );
 
-    // Tirar dinheiro do comprador
-    await db.query('UPDATE users SET coins = coins - $1 WHERE id = $2', [price, buyerId]);
+    if (buyerRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Usuário não encontrado' });
+    }
 
-    // Dar dinheiro ao vendedor
-    await db.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [price, sellerId]);
+    const buyer = buyerRes.rows[0];
 
-    // Transferir Item
-    await db.query('UPDATE items SET owner_id = $1, is_listed = false, price = 0 WHERE id = $2', [buyerId, itemId]);
+    if (buyer.coins < price) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Saldo insuficiente' });
+    }
 
-    // Registrar Transação
-    await db.query("INSERT INTO transactions (user_id, amount, description, type) VALUES ($1, $2, 'Compra Marketplace', 'market_buy')", [buyerId, -price]);
-    await db.query("INSERT INTO transactions (user_id, amount, description, type) VALUES ($1, $2, 'Venda Marketplace', 'market_sell')", [sellerId, price]);
+    /*
+    3️⃣ Lock vendedor
+    */
+    const sellerRes = await client.query(
+      'SELECT coins FROM users WHERE id = $1 FOR UPDATE',
+      [sellerId]
+    );
 
-    await db.query('COMMIT');
-    res.json({ success: true, message: 'Compra realizada!' });
+    if (sellerRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Vendedor não encontrado' });
+    }
 
-  } catch (err) {
-    await db.query('ROLLBACK');
-    res.status(500).json({ message: 'Erro na compra' });
+    /*
+    4️⃣ Executar transferência
+    */
+
+    // Debitar comprador
+    await client.query(
+      'UPDATE users SET coins = coins - $1 WHERE id = $2',
+      [price, buyerId]
+    );
+
+    // Creditar vendedor
+    await client.query(
+      'UPDATE users SET coins = coins + $1 WHERE id = $2',
+      [price, sellerId]
+    );
+
+    // Transferir item
+    await client.query(
+      `UPDATE items
+       SET owner_id = $1,
+           is_listed = false,
+           price = 0
+       WHERE id = $2`,
+      [buyerId, itemId]
+    );
+
+    /*
+    5️⃣ Registrar transações
+    */
+
+    // Extrato comprador
+    await client.query(
+      `INSERT INTO transactions (user_id, amount, description, type)
+       VALUES ($1, $2, $3, $4)`,
+      [buyerId, -price, `Compra Marketplace: ${item.name}`, 'market_buy']
+    );
+
+    // Extrato vendedor
+    await client.query(
+      `INSERT INTO transactions (user_id, amount, description, type)
+       VALUES ($1, $2, $3, $4)`,
+      [sellerId, price, `Venda Marketplace: ${item.name}`, 'market_sell']
+    );
+
+    /*
+    6️⃣ Criar registro de pedido
+    */
+    await client.query(
+      `INSERT INTO orders (user_id, product_id, price_paid, status)
+       VALUES ($1, $2, $3, $4)`,
+      [buyerId, itemId, price, 'completed']
+    );
+
+    await client.query('COMMIT');
+
+    res.status(200).json({
+      success: true,
+      message: 'Compra realizada com sucesso!',
+      newBalance: buyer.coins - price
+    });
+
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error("Erro na compra marketplace:", error);
+    res.status(500).json({ message: 'Erro ao processar compra' });
+  } finally {
+    client.release();
   }
 };
