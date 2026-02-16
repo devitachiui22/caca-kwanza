@@ -1,104 +1,174 @@
 const db = require('../config/db');
 
-// Listar itens próximos (Raio de 5km)
+/**
+ * ===============================
+ * BUSCAR ITENS PRÓXIMOS (FULL)
+ * ===============================
+ */
 exports.getNearbyItems = async (req, res) => {
-  const { lat, lon } = req.query;
+  const { lat, lng, radius } = req.query;
+  const userId = req.user.id;
 
-  if (!lat || !lon) {
-    return res.status(400).json({ message: 'Latitude e Longitude necessárias' });
+  const radiusKm = radius ? parseFloat(radius) : 2.0; // padrão 2km
+
+  if (!lat || !lng) {
+    return res.status(400).json({ message: "Latitude e Longitude são obrigatórias" });
   }
 
   try {
-    // Fórmula Haversine SQL para calcular distância em KM
     const query = `
-      SELECT id, name, type, rarity, latitude, longitude,
-      ( 6371 * acos( cos( radians($1) ) * cos( radians( latitude ) )
-      * cos( radians( longitude ) - radians($2) ) + sin( radians($1) )
-      * sin( radians( latitude ) ) ) ) AS distance
-      FROM items
-      WHERE active = true AND is_listed = false
-      HAVING distance < 5
-      ORDER BY distance ASC;
+      SELECT i.id, i.name, i.type, i.rarity, i.latitude, i.longitude,
+      (6371 * acos(
+        cos(radians($1)) * cos(radians(i.latitude)) *
+        cos(radians(i.longitude) - radians($2)) +
+        sin(radians($1)) * sin(radians(i.latitude))
+      )) AS distance
+      FROM items i
+      WHERE i.active = true
+      AND i.is_listed = false
+      AND i.id NOT IN (
+        SELECT item_id FROM captures WHERE user_id = $3
+      )
+      AND (6371 * acos(
+        cos(radians($1)) * cos(radians(i.latitude)) *
+        cos(radians(i.longitude) - radians($2)) +
+        sin(radians($1)) * sin(radians(i.latitude))
+      )) <= $4
+      ORDER BY distance ASC
+      LIMIT 30;
     `;
 
-    // Nota: O "HAVING distance" direto requer CTE ou subquery em Postgres puro,
-    // mas vamos simplificar filtrando no código se der erro no Neon free tier.
-    // Abaixo versão simplificada compatível com Neon padrão:
+    const result = await db.query(query, [lat, lng, userId, radiusKm]);
 
-    const rawData = await db.query('SELECT * FROM items WHERE active = true AND is_listed = false');
+    res.status(200).json(result.rows);
 
-    // Filtragem JS para garantir compatibilidade sem extensões complexas
-    const items = rawData.rows.map(item => {
-        const R = 6371; // Raio da Terra km
-        const dLat = (item.latitude - lat) * Math.PI / 180;
-        const dLon = (item.longitude - lon) * Math.PI / 180;
-        const a =
-           Math.sin(dLat/2) * Math.sin(dLat/2) +
-           Math.cos(lat * Math.PI / 180) * Math.cos(item.latitude * Math.PI / 180) *
-           Math.sin(dLon/2) * Math.sin(dLon/2);
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-        const d = R * c;
-        return { ...item, distance: d };
-    }).filter(item => item.distance <= 2); // Retorna itens num raio de 2km
-
-    res.json(items);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Erro ao buscar itens' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: "Erro ao buscar itens próximos" });
   }
 };
 
-// CAPTURAR ITEM
+
+/**
+ * ===============================
+ * CAPTURAR ITEM (FULL + ANTI-CHEAT)
+ * ===============================
+ */
 exports.captureItem = async (req, res) => {
-  const { itemId, lat, lon } = req.body;
+  const { itemId, lat, lng } = req.body;
   const userId = req.user.id;
 
+  if (!itemId || !lat || !lng) {
+    return res.status(400).json({ message: "Dados incompletos para captura" });
+  }
+
   try {
-    // 1. Verificar Item
-    const itemResult = await db.query('SELECT * FROM items WHERE id = $1 AND active = true', [itemId]);
-    if (itemResult.rows.length === 0) {
-      return res.status(404).json({ message: 'Item não encontrado ou já capturado.' });
-    }
-    const item = itemResult.rows[0];
-
-    // 2. Verificar Distância (Backend Validation - Anti-Cheat básico)
-    // Se o usuário estiver a mais de 100 metros (0.1km), bloqueia
-    // Implementação simplificada aqui:
-    const R = 6371;
-    const dLat = (item.latitude - lat) * Math.PI / 180;
-    const dLon = (item.longitude - lon) * Math.PI / 180;
-    const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
-              Math.cos(lat * Math.PI / 180) * Math.cos(item.latitude * Math.PI / 180) *
-              Math.sin(dLon/2) * Math.sin(dLon/2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-    const distance = R * c;
-
-    if (distance > 0.15) { // 150 metros de tolerância
-        return res.status(400).json({ message: 'Você está muito longe do item!' });
-    }
-
-    // 3. Processar Captura (Transação)
     await db.query('BEGIN');
 
-    // Desativar item (ou colocar em cooldown)
-    await db.query('UPDATE items SET active = false, owner_id = $1 WHERE id = $2', [userId, itemId]);
+    /**
+     * 1️⃣ Buscar item e travar linha (FOR UPDATE evita captura dupla simultânea)
+     */
+    const itemResult = await db.query(
+      'SELECT * FROM items WHERE id = $1 AND active = true FOR UPDATE',
+      [itemId]
+    );
 
-    // Dar pontos e moedas
-    const points = item.rarity === 'legendary' ? 500 : item.rarity === 'rare' ? 100 : 10;
-    const coins = item.rarity === 'legendary' ? 50 : item.rarity === 'rare' ? 10 : 1;
+    if (itemResult.rows.length === 0) {
+      await db.query('ROLLBACK');
+      return res.status(404).json({ message: "Item não encontrado ou já capturado." });
+    }
 
-    await db.query('UPDATE users SET points = points + $1, coins = coins + $2 WHERE id = $3', [points, coins, userId]);
+    const item = itemResult.rows[0];
 
-    // Registrar Captura
-    await db.query('INSERT INTO captures (user_id, item_id, points_earned) VALUES ($1, $2, $3)', [userId, itemId, points]);
+    /**
+     * 2️⃣ Verificar se já capturou
+     */
+    const alreadyCaptured = await db.query(
+      'SELECT 1 FROM captures WHERE user_id = $1 AND item_id = $2',
+      [userId, itemId]
+    );
+
+    if (alreadyCaptured.rows.length > 0) {
+      await db.query('ROLLBACK');
+      return res.status(400).json({ message: "Você já capturou este item!" });
+    }
+
+    /**
+     * 3️⃣ Verificação de distância (ANTI-CHEAT)
+     * Limite: 150 metros
+     */
+    const R = 6371;
+    const dLat = (item.latitude - lat) * Math.PI / 180;
+    const dLon = (item.longitude - lng) * Math.PI / 180;
+
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(lat * Math.PI / 180) *
+      Math.cos(item.latitude * Math.PI / 180) *
+      Math.sin(dLon / 2) * Math.sin(dLon / 2);
+
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const distance = R * c;
+
+    if (distance > 0.15) {
+      await db.query('ROLLBACK');
+      return res.status(400).json({ message: "Você está muito longe do item!" });
+    }
+
+    /**
+     * 4️⃣ Definir recompensa por raridade
+     */
+    let points = 10;
+    let coins = 1;
+
+    if (item.rarity === 'rare') {
+      points = 100;
+      coins = 10;
+    }
+
+    if (item.rarity === 'legendary') {
+      points = 500;
+      coins = 50;
+    }
+
+    /**
+     * 5️⃣ Desativar item e definir dono
+     */
+    await db.query(
+      'UPDATE items SET active = false, owner_id = $1 WHERE id = $2',
+      [userId, itemId]
+    );
+
+    /**
+     * 6️⃣ Atualizar usuário
+     */
+    await db.query(
+      'UPDATE users SET points = points + $1, coins = coins + $2 WHERE id = $3',
+      [points, coins, userId]
+    );
+
+    /**
+     * 7️⃣ Registrar captura
+     */
+    await db.query(
+      'INSERT INTO captures (user_id, item_id, points_earned) VALUES ($1, $2, $3)',
+      [userId, itemId, points]
+    );
 
     await db.query('COMMIT');
 
-    res.json({ success: true, message: `Você capturou ${item.name}!`, earned: { points, coins } });
+    res.status(200).json({
+      success: true,
+      message: `Você capturou ${item.name}!`,
+      earned: {
+        points,
+        coins
+      }
+    });
 
-  } catch (err) {
+  } catch (error) {
     await db.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ message: 'Erro na captura' });
+    console.error(error);
+    res.status(500).json({ message: "Erro ao processar captura" });
   }
 };
