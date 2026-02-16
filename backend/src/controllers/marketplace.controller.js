@@ -10,18 +10,15 @@ exports.getListings = async (req, res) => {
     const result = await db.query(`
       SELECT *
       FROM items
-      WHERE is_listed = true
-      AND active = true
+      WHERE is_listed = true AND active = true
       ORDER BY created_at DESC
     `);
-
     res.status(200).json(result.rows);
   } catch (error) {
     console.error("Erro ao listar marketplace:", error);
     res.status(500).json({ message: 'Erro ao listar mercado' });
   }
 };
-
 
 /*
 ==================================================
@@ -41,15 +38,9 @@ exports.buyItem = async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    /*
-    1️⃣ Buscar item com LOCK
-    */
+    // 1️⃣ Buscar item com LOCK
     const itemRes = await client.query(
-      `SELECT * FROM items
-       WHERE id = $1
-       AND is_listed = true
-       AND active = true
-       FOR UPDATE`,
+      `SELECT * FROM items WHERE id=$1 AND is_listed=true AND active=true FOR UPDATE`,
       [itemId]
     );
 
@@ -67,11 +58,9 @@ exports.buyItem = async (req, res) => {
       return res.status(400).json({ message: 'Você não pode comprar seu próprio item' });
     }
 
-    /*
-    2️⃣ Lock comprador
-    */
+    // 2️⃣ Lock comprador
     const buyerRes = await client.query(
-      'SELECT coins FROM users WHERE id = $1 FOR UPDATE',
+      'SELECT coins FROM users WHERE id=$1 FOR UPDATE',
       [buyerId]
     );
 
@@ -81,17 +70,14 @@ exports.buyItem = async (req, res) => {
     }
 
     const buyer = buyerRes.rows[0];
-
     if (buyer.coins < price) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Saldo insuficiente' });
     }
 
-    /*
-    3️⃣ Lock vendedor
-    */
+    // 3️⃣ Lock vendedor
     const sellerRes = await client.query(
-      'SELECT coins FROM users WHERE id = $1 FOR UPDATE',
+      'SELECT coins FROM users WHERE id=$1 FOR UPDATE',
       [sellerId]
     );
 
@@ -100,56 +86,27 @@ exports.buyItem = async (req, res) => {
       return res.status(404).json({ message: 'Vendedor não encontrado' });
     }
 
-    /*
-    4️⃣ Executar transferência
-    */
-
-    // Debitar comprador
+    // 4️⃣ Transferência de moedas e item
+    await client.query('UPDATE users SET coins = coins - $1 WHERE id = $2', [price, buyerId]);
+    await client.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [price, sellerId]);
     await client.query(
-      'UPDATE users SET coins = coins - $1 WHERE id = $2',
-      [price, buyerId]
-    );
-
-    // Creditar vendedor
-    await client.query(
-      'UPDATE users SET coins = coins + $1 WHERE id = $2',
-      [price, sellerId]
-    );
-
-    // Transferir item
-    await client.query(
-      `UPDATE items
-       SET owner_id = $1,
-           is_listed = false,
-           price = 0
-       WHERE id = $2`,
+      'UPDATE items SET owner_id=$1, is_listed=false, price=0 WHERE id=$2',
       [buyerId, itemId]
     );
 
-    /*
-    5️⃣ Registrar transações
-    */
-
-    // Extrato comprador
+    // 5️⃣ Registrar transações
     await client.query(
-      `INSERT INTO transactions (user_id, amount, description, type)
-       VALUES ($1, $2, $3, $4)`,
+      'INSERT INTO transactions (user_id, amount, description, type) VALUES ($1,$2,$3,$4)',
       [buyerId, -price, `Compra Marketplace: ${item.name}`, 'market_buy']
     );
-
-    // Extrato vendedor
     await client.query(
-      `INSERT INTO transactions (user_id, amount, description, type)
-       VALUES ($1, $2, $3, $4)`,
+      'INSERT INTO transactions (user_id, amount, description, type) VALUES ($1,$2,$3,$4)',
       [sellerId, price, `Venda Marketplace: ${item.name}`, 'market_sell']
     );
 
-    /*
-    6️⃣ Criar registro de pedido
-    */
+    // 6️⃣ Criar registro de pedido
     await client.query(
-      `INSERT INTO orders (user_id, product_id, price_paid, status)
-       VALUES ($1, $2, $3, $4)`,
+      'INSERT INTO orders (user_id, product_id, price_paid, status) VALUES ($1,$2,$3,$4)',
       [buyerId, itemId, price, 'completed']
     );
 
